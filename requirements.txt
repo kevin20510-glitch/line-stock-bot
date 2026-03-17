@@ -1,8 +1,8 @@
-flask==3.0.3
-line-bot-sdk==3.12.0
-gunicorn==23.0.0
-requests==2.32.3
-urllib3==2.2.2
-pandas==2.2.2
-twstock==1.4.0
-ta==0.11.0
+flask
+line-bot-sdk
+gunicorn
+requests
+urllib3
+pandas
+twstock
+ta
