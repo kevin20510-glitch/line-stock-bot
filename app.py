@@ -5,13 +5,14 @@ import urllib3
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple
+from threading import Lock
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 import twstock
-from flask import Flask, request, abort
+from flask import Flask, abort, request
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
 
@@ -38,18 +39,20 @@ HEADERS = {
     )
 }
 
-# 關閉 SSL 警告
+PRICE_CACHE_TTL = 300
+NEWS_CACHE_TTL = 600
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 只針對 TWSE 關閉 verify，避免 Render / Python 3.14 憑證問題
 _original_request = requests.sessions.Session.request
 
 
 def patched_request(self, method, url, **kwargs):
+    host = ""
     try:
         host = urlparse(url).hostname or ""
     except Exception:
-        host = ""
+        pass
 
     if host in {"www.twse.com.tw", "twse.com.tw"}:
         kwargs["verify"] = False
@@ -58,9 +61,6 @@ def patched_request(self, method, url, **kwargs):
 
 
 requests.sessions.Session.request = patched_request
-
-PRICE_CACHE_TTL = 300
-NEWS_CACHE_TTL = 600
 
 BULLISH_KEYWORDS = [
     "營收成長", "營收創高", "獲利成長", "eps", "擴產", "接單", "訂單", "法說會樂觀",
@@ -100,6 +100,12 @@ MANUAL_NAME_TO_CODE = {
     "元大台灣50": "0050",
 }
 
+MANUAL_CODE_TO_NAME = {v: k for k, v in MANUAL_NAME_TO_CODE.items()}
+
+CODE_TO_NAME: Optional[Dict[str, str]] = None
+NAME_TO_CODE: Optional[Dict[str, str]] = None
+CODE_MAP_LOCK = Lock()
+
 
 @dataclass
 class NewsItem:
@@ -128,11 +134,19 @@ def build_code_name_maps() -> Tuple[Dict[str, str], Dict[str, str]]:
 
     for name, code in MANUAL_NAME_TO_CODE.items():
         name_to_code[name] = code
+        code_to_name.setdefault(code, name)
 
     return code_to_name, name_to_code
 
 
-CODE_TO_NAME, NAME_TO_CODE = build_code_name_maps()
+def ensure_code_maps():
+    global CODE_TO_NAME, NAME_TO_CODE
+    if CODE_TO_NAME is not None and NAME_TO_CODE is not None:
+        return
+
+    with CODE_MAP_LOCK:
+        if CODE_TO_NAME is None or NAME_TO_CODE is None:
+            CODE_TO_NAME, NAME_TO_CODE = build_code_name_maps()
 
 
 class StockAnalyzer:
@@ -152,7 +166,6 @@ class StockAnalyzer:
             if s.startswith(prefix):
                 s = s[len(prefix):].strip()
                 break
-
         return s
 
     def is_link_request(self, text: str) -> bool:
@@ -164,36 +177,38 @@ class StockAnalyzer:
         if not s:
             raise ValueError("請輸入台股代碼或中文名稱")
 
-        if s in NAME_TO_CODE:
-            code = NAME_TO_CODE[s]
-            return code, CODE_TO_NAME.get(code, s)
+        if s in MANUAL_NAME_TO_CODE:
+            code = MANUAL_NAME_TO_CODE[s]
+            return code, MANUAL_CODE_TO_NAME.get(code, s)
 
         if s.isdigit() and len(s) == 4:
-            if s in CODE_TO_NAME:
+            ensure_code_maps()
+            if CODE_TO_NAME and s in CODE_TO_NAME:
                 return s, CODE_TO_NAME[s]
             raise ValueError(f"找不到台股代碼：{s}")
 
-        if s in CODE_TO_NAME:
-            return s, CODE_TO_NAME[s]
+        ensure_code_maps()
+
+        if NAME_TO_CODE and s in NAME_TO_CODE:
+            code = NAME_TO_CODE[s]
+            return code, CODE_TO_NAME.get(code, s) if CODE_TO_NAME else s
 
         lowered = s.lower()
-        for name, code in NAME_TO_CODE.items():
-            if lowered == name.lower():
-                return code, CODE_TO_NAME.get(code, name)
 
-        for code, name in CODE_TO_NAME.items():
-            if s in name:
-                return code, name
+        if NAME_TO_CODE:
+            for name, code in NAME_TO_CODE.items():
+                if lowered == name.lower():
+                    return code, CODE_TO_NAME.get(code, name) if CODE_TO_NAME else name
+
+            for code, name in CODE_TO_NAME.items():
+                if s in name:
+                    return code, name
 
         raise ValueError(f"找不到『{user_input}』對應的台股代碼")
 
     def set_user_last_query(self, user_id: str, code: str, name: str):
-        if not user_id:
-            return
-        self.user_last_query[user_id] = {
-            "code": code,
-            "name": name,
-        }
+        if user_id:
+            self.user_last_query[user_id] = {"code": code, "name": name}
 
     def get_last_news_links_text(self, user_id: str) -> str:
         if not user_id:
@@ -205,12 +220,10 @@ class StockAnalyzer:
 
         code = last.get("code")
         name = last.get("name")
-
         if not code or not name:
             return "目前沒有你的最近查詢紀錄，請先重新查詢股票。"
 
         news = self.fetch_google_news(code, name)
-
         if not news:
             return f"{name}（{code}）目前找不到近期新聞連結。"
 
@@ -220,9 +233,7 @@ class StockAnalyzer:
             lines.append(n.link)
 
         reply = "\n".join(lines)
-        if len(reply) > 4500:
-            reply = reply[:4500] + "\n（內容過長，已自動截斷）"
-        return reply
+        return reply[:4500] if len(reply) > 4500 else reply
 
     def _get_price_cache(self, key: str):
         item = self.price_cache.get(key)
@@ -230,7 +241,6 @@ class StockAnalyzer:
             return None
         ts, df, name, code = item
         if time.time() - ts <= PRICE_CACHE_TTL:
-            print(f"價格快取命中: {key}")
             return df.copy(), name, code
         self.price_cache.pop(key, None)
         return None
@@ -245,7 +255,7 @@ class StockAnalyzer:
             print(f"抓取 {stock.sid} {year}-{month:02d} 失敗: {e}")
             return []
 
-    def get_price_history(self, symbol: str, months: int = 14) -> Tuple[pd.DataFrame, str, str]:
+    def get_price_history(self, symbol: str, months: int = 8) -> Tuple[pd.DataFrame, str, str]:
         code, name = self.resolve_symbol(symbol)
         cache_key = f"{code}|{months}"
 
@@ -267,7 +277,7 @@ class StockAnalyzer:
             monthly = self._fetch_monthly_history(stock, y, m)
             if monthly:
                 rows.extend(monthly)
-            time.sleep(0.2)
+            time.sleep(0.08)
 
         if not rows:
             raise ValueError(f"抓不到 {name}（{code}）的價格資料")
@@ -298,7 +308,7 @@ class StockAnalyzer:
 
         df = df.sort_values("Date").dropna(subset=["Close"]).set_index("Date")
 
-        if len(df) < 30:
+        if len(df) < 65:
             raise ValueError(f"{name}（{code}）歷史資料不足，暫時無法分析")
 
         self._set_price_cache(cache_key, df, name, code)
@@ -329,14 +339,12 @@ class StockAnalyzer:
         return best[0] if best[1] > 0 else "其他"
 
     def build_news_query(self, code: str, name: str) -> str:
-        keywords = [code, name]
-        return " OR ".join(f'"{k}"' for k in keywords if k)
+        return " OR ".join(f'"{k}"' for k in [code, name] if k)
 
     def summarize_title(self, title: str, sentiment: str, matched: List[str]) -> str:
         tone = {"利多": "偏正面", "利空": "偏負面", "中性": "中性"}[sentiment]
         if matched:
-            key_text = "、".join(matched[:3])
-            return f"{tone}：標題提到 {key_text}。"
+            return f"{tone}：標題提到 {'、'.join(matched[:3])}。"
         return f"{tone}：目前只從標題判讀，建議點進原文再確認細節。"
 
     def analyze_news_sentiment(self, text: str) -> Tuple[str, int, List[str], str]:
@@ -367,9 +375,8 @@ class StockAnalyzer:
     def resolve_google_news_link(self, url: str) -> str:
         if not url:
             return url
-
         try:
-            resp = self.session.get(url, timeout=10, allow_redirects=True, stream=True)
+            resp = self.session.get(url, timeout=8, allow_redirects=True, stream=True)
             final_url = resp.url
             resp.close()
             return final_url or url
@@ -377,13 +384,12 @@ class StockAnalyzer:
             print("解析 Google News 連結失敗:", e)
             return url
 
-    def fetch_google_news(self, code: str, name: str, days: int = 30, max_items: int = 5) -> List[NewsItem]:
+    def fetch_google_news(self, code: str, name: str, days: int = 30, max_items: int = 4) -> List[NewsItem]:
         cache_key = f"{code}|{name}|{days}|{max_items}"
         item = self.news_cache.get(cache_key)
         if item:
             ts, cached_news = item
             if time.time() - ts <= NEWS_CACHE_TTL:
-                print(f"新聞快取命中: {cache_key}")
                 return cached_news
 
         query = self.build_news_query(code, name)
@@ -392,19 +398,16 @@ class StockAnalyzer:
             + urllib.parse.quote(query)
         )
 
-        print("Google News RSS:", rss_url)
-
-        resp = self.session.get(rss_url, timeout=20)
+        resp = self.session.get(rss_url, timeout=15)
         resp.raise_for_status()
 
         root = ET.fromstring(resp.text)
-        items = []
+        items: List[NewsItem] = []
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
         for item in root.findall("./channel/item"):
             title = (item.findtext("title") or "").strip()
             pub_date = (item.findtext("pubDate") or "").strip()
-
             raw_link = (item.findtext("link") or "").strip()
             link = self.resolve_google_news_link(raw_link)
 
@@ -519,18 +522,9 @@ class StockAnalyzer:
         total = sum(item.score for item in news)
         score = max(0, min(100, 50 + total * 4))
 
-        good = [
-            f"{n.published}｜{n.source}｜{n.title}"
-            for n in news if n.sentiment == "利多"
-        ]
-        bad = [
-            f"{n.published}｜{n.source}｜{n.title}"
-            for n in news if n.sentiment == "利空"
-        ]
-        brief = [
-            f"{n.published}｜{n.source}｜{n.summary}"
-            for n in news[:2]
-        ]
+        good = [f"{n.published}｜{n.source}｜{n.title}" for n in news if n.sentiment == "利多"]
+        bad = [f"{n.published}｜{n.source}｜{n.title}" for n in news if n.sentiment == "利空"]
+        brief = [f"{n.published}｜{n.source}｜{n.summary}" for n in news[:2]]
 
         return round(score), good[:2], bad[:2], brief
 
@@ -565,11 +559,8 @@ class StockAnalyzer:
 
     def analyze_stock_text(self, user_input: str) -> str:
         query = self.normalize_symbol(user_input)
-        print("analyze_stock_text query:", query)
 
         df, name, code = self.get_price_history(query)
-        print("價格資料筆數:", len(df))
-
         df = self.compute_indicators(df)
         row = df.iloc[-1]
         news = self.fetch_google_news(code, name)
@@ -596,18 +587,14 @@ class StockAnalyzer:
 
         if good_news:
             lines.append("利多新聞：\n" + good_news[0])
-
         if bad_news:
             lines.append("利空新聞：\n" + bad_news[0])
-
         if news_brief:
             lines.append("新聞重點：\n" + news_brief[0])
 
         reply = "\n".join(lines)
-
         if len(reply) > 4500:
             reply = reply[:4500] + "\n（內容過長，已自動截斷）"
-
         return reply
 
 
@@ -651,7 +638,6 @@ def callback():
 def handle_message(event):
     user_text = event.message.text.strip()
 
-    user_id = ""
     try:
         user_id = event.source.user_id
     except Exception:
@@ -664,16 +650,9 @@ def handle_message(event):
     else:
         try:
             query = analyzer.normalize_symbol(user_text)
-            print("收到訊息:", repr(user_text))
-            print("user_id:", user_id)
-            print("整理後查詢:", repr(query))
-
             code, name = analyzer.resolve_symbol(query)
-            print("解析代碼:", code, name)
-
             analyzer.set_user_last_query(user_id, code, name)
             reply_text = analyzer.analyze_stock_text(query)
-
         except Exception as e:
             print("分析失敗:", e)
             reply_text = f"分析失敗：{e}\n\n{get_help_text()}"
@@ -684,14 +663,14 @@ def handle_message(event):
         line_bot_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)]
+                messages=[TextMessage(text=reply_text)],
             )
         )
 
 
 @app.route("/", methods=["GET"])
 def home():
-    return "LINE 台股機器人運作中 v2-twstock-no-url"
+    return "LINE 台股機器人運作中 v3-lite"
 
 
 if __name__ == "__main__":
