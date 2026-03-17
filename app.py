@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import pandas as pd
 import requests
 import twstock
-from flask import Flask, abort, request
+from flask import Flask, abort, request, redirect
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
 
@@ -31,6 +31,8 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 PORT = int(os.getenv("PORT", "10000"))
+
+BASE_URL = "https://line-stock-bot-jwjp.onrender.com"
 
 HEADERS = {
     "User-Agent": (
@@ -261,16 +263,8 @@ class StockAnalyzer:
         if not code or not name:
             return "目前沒有你的最近查詢紀錄，請先重新查詢股票。"
 
-        news = self.fetch_google_news(code, name)
-        if not news:
-            return f"{name}（{code}）目前找不到近期新聞連結。"
-
-        lines = [f"{name}（{code}）新聞連結："]
-        for i, item in enumerate(news[:3], start=1):
-            lines.append(f"{i}. {item.title}")
-            lines.append(item.link)
-
-        return clamp_reply_text("\n".join(lines))
+        short_url = f"{BASE_URL}/news/{code}"
+        return f"{name}（{code}）新聞連結：\n{short_url}"
 
     def _get_price_cache(self, key: str):
         item = self.price_cache.get(key)
@@ -707,6 +701,26 @@ def home():
     return "LINE 台股機器人運作中"
 
 
+@app.route("/news/<code>", methods=["GET"])
+def news_redirect(code):
+    ensure_code_maps()
+
+    name = None
+    if CODE_TO_NAME and code in CODE_TO_NAME:
+        name = PREFERRED_CODE_TO_NAME.get(code, CODE_TO_NAME[code])
+
+    if not name:
+        return f"找不到股票代碼：{code}", 404
+
+    query = f'"{code}" OR "{name}"'
+    news_url = (
+        "https://news.google.com/search?q="
+        + urllib.parse.quote(query)
+        + "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    )
+    return redirect(news_url, code=302)
+
+
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
@@ -736,6 +750,8 @@ def handle_message(event):
 
     if user_text.lower() in ["help", "說明", "幫助"]:
         reply_text = get_help_text()
+    elif user_text.strip() == "新聞":
+        reply_text = "請先查詢股票，再輸入「新聞連結」。例如：\n群創\n新聞連結"
     elif analyzer.is_link_request(user_text):
         reply_text = analyzer.get_last_news_links_text(user_id)
     else:
