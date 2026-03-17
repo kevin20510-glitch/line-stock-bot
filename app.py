@@ -668,7 +668,7 @@ def handle_message(event):
 
 @app.route("/", methods=["GET"])
 def home():
-    return "LINE 台股機器人運作中"
+    return "LINE 台股機器人運作中 v2-twstock-no-url"
 
 
 if __name__ == "__main__":
