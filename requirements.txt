@@ -1,8 +1,4 @@
 flask
-gunicorn
-pandas
-requests
-twstock
-ta
 line-bot-sdk
-lxml
+gunicorn
+requests
