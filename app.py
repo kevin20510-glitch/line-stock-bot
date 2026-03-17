@@ -36,15 +36,18 @@ HEADERS = {
 }
 
 BULLISH_KEYWORDS = [
-    "營收成長", "營收創高", "獲利成長", "eps", "擴產", "接單", "訂單", "法說會樂觀", "股利", "配息",
-    "ai", "合作", "併購", "上調目標價", "調升評等", "利多", "簽約", "新品", "突破", "創高", "回購",
-    "revenue growth", "profit growth", "beat", "upgrade", "partnership", "contract", "expansion", "buyback", "surge"
+    "營收成長", "營收創高", "獲利成長", "eps", "擴產", "接單", "訂單", "法說會樂觀",
+    "股利", "配息", "ai", "合作", "併購", "上調目標價", "調升評等", "利多",
+    "簽約", "新品", "突破", "創高", "回購",
+    "revenue growth", "profit growth", "beat", "upgrade", "partnership",
+    "contract", "expansion", "buyback", "surge"
 ]
 
 BEARISH_KEYWORDS = [
-    "營收衰退", "虧損", "下修", "減產", "裁員", "違約", "訴訟", "調降評等", "降評", "事故", "停工",
-    "停牌", "利空", "衰退", "風險", "重挫", "賠償", "詐欺", "內線", "破底", "downgrade", "lawsuit",
-    "loss", "decline", "weak guidance", "fraud", "drop", "plunge"
+    "營收衰退", "虧損", "下修", "減產", "裁員", "違約", "訴訟", "調降評等", "降評",
+    "事故", "停工", "停牌", "利空", "衰退", "風險", "重挫", "賠償", "詐欺", "內線",
+    "破底", "downgrade", "lawsuit", "loss", "decline", "weak guidance",
+    "fraud", "drop", "plunge"
 ]
 
 SECTOR_KEYWORDS = {
@@ -105,6 +108,7 @@ class NewsItem:
     title: str
     published: str
     source: str
+    link: str
     sentiment: str
     score: int
     matched_keywords: List[str]
@@ -119,10 +123,8 @@ class StockAnalyzer:
     def normalize_symbol(self, symbol: str) -> str:
         s = symbol.strip().replace("　", " ")
         s = " ".join(s.split())
-
         if s.startswith("分析 "):
             s = s[3:].strip()
-
         return s
 
     def resolve_symbol(self, user_input: str) -> str:
@@ -171,6 +173,7 @@ class StockAnalyzer:
     def get_price_history(self, symbol: str, period: str = "1y") -> Tuple[pd.DataFrame, str, str]:
         resolved_symbol = self.resolve_symbol(symbol)
         candidates = [resolved_symbol]
+
         if resolved_symbol.endswith(".TW"):
             candidates.append(resolved_symbol.replace(".TW", ".TWO"))
         elif resolved_symbol.endswith(".TWO"):
@@ -200,8 +203,10 @@ class StockAnalyzer:
         out["MA20"] = SMAIndicator(out["Close"], window=20).sma_indicator()
         out["MA60"] = SMAIndicator(out["Close"], window=60).sma_indicator()
         out["RSI14"] = RSIIndicator(out["Close"], window=14).rsi()
+
         macd = MACD(out["Close"], window_fast=12, window_slow=26, window_sign=9)
         out["MACD_HIST"] = macd.macd_diff()
+
         out["AVG_VOL20"] = out["Volume"].rolling(20, min_periods=1).mean()
         out["RET20"] = out["Close"].pct_change(20) * 100
         out["RET60"] = out["Close"].pct_change(60) * 100
@@ -235,6 +240,7 @@ class StockAnalyzer:
         lowered = text.lower()
         bull_matches = [kw for kw in BULLISH_KEYWORDS if kw.lower() in lowered]
         bear_matches = [kw for kw in BEARISH_KEYWORDS if kw.lower() in lowered]
+
         bull_score = len(bull_matches) * 2
         bear_score = len(bear_matches) * 2
         net = bull_score - bear_score
@@ -255,14 +261,16 @@ class StockAnalyzer:
         summary = self.summarize_title(text, sentiment, matched)
         return sentiment, score, matched, summary
 
-    def fetch_google_news(self, symbol: str, name: str, days: int = 30, max_items: int = 8) -> List[NewsItem]:
+    def fetch_google_news(self, symbol: str, name: str, days: int = 30, max_items: int = 5) -> List[NewsItem]:
         query = self.build_news_query(symbol, name)
         rss_url = (
             "https://news.google.com/rss/search?hl=zh-TW&gl=TW&ceid=TW:zh-Hant&q="
             + urllib.parse.quote(query)
         )
+
         resp = self.session.get(rss_url, timeout=20)
         resp.raise_for_status()
+
         root = ET.fromstring(resp.text)
         items = []
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -270,11 +278,14 @@ class StockAnalyzer:
         for item in root.findall("./channel/item"):
             title = (item.findtext("title") or "").strip()
             pub_date = (item.findtext("pubDate") or "").strip()
+            link = (item.findtext("link") or "").strip()
             source_el = item.find("source")
             source = source_el.text.strip() if source_el is not None and source_el.text else "未知來源"
 
             try:
-                published_dt = datetime.strptime(pub_date, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
+                published_dt = datetime.strptime(
+                    pub_date, "%a, %d %b %Y %H:%M:%S GMT"
+                ).replace(tzinfo=timezone.utc)
             except Exception:
                 published_dt = datetime.now(timezone.utc)
 
@@ -282,11 +293,13 @@ class StockAnalyzer:
                 continue
 
             sentiment, score, matched, summary = self.analyze_news_sentiment(title)
+
             items.append(
                 NewsItem(
                     title=title,
                     published=published_dt.astimezone().strftime("%Y-%m-%d"),
                     source=source,
+                    link=link,
                     sentiment=sentiment,
                     score=score,
                     matched_keywords=matched,
@@ -301,6 +314,7 @@ class StockAnalyzer:
 
     def score_trend(self, row: pd.Series) -> Tuple[int, str]:
         score = 50
+
         close = float(row["Close"])
         ma20 = float(row["MA20"]) if pd.notna(row["MA20"]) else close
         ma60 = float(row["MA60"]) if pd.notna(row["MA60"]) else close
@@ -347,12 +361,14 @@ class StockAnalyzer:
 
         high_gap = (close / high_52w - 1) * 100 if high_52w else 0
         low_gap = (close / low_52w - 1) * 100 if low_52w else 0
+
         if high_gap > -10:
             score += 4
         if low_gap < 5:
             score -= 4
 
         score = max(0, min(100, round(score)))
+
         if score >= 75:
             signal = "強勢"
         elif score >= 60:
@@ -363,17 +379,30 @@ class StockAnalyzer:
             signal = "偏弱"
         else:
             signal = "弱勢"
+
         return score, signal
 
     def score_news(self, news: List[NewsItem]) -> Tuple[int, List[str], List[str], List[str]]:
         if not news:
             return 50, [], [], []
+
         total = sum(item.score for item in news)
         score = max(0, min(100, 50 + total * 4))
-        good = [f"{n.published}｜{n.title}" for n in news if n.sentiment == "利多"]
-        bad = [f"{n.published}｜{n.title}" for n in news if n.sentiment == "利空"]
-        brief = [f"{n.published}｜{n.source}｜{n.summary}" for n in news[:3]]
-        return round(score), good[:3], bad[:3], brief
+
+        good = [
+            f"{n.published}｜{n.title}\n連結：{n.link}"
+            for n in news if n.sentiment == "利多"
+        ]
+        bad = [
+            f"{n.published}｜{n.title}\n連結：{n.link}"
+            for n in news if n.sentiment == "利空"
+        ]
+        brief = [
+            f"{n.published}｜{n.source}｜{n.summary}\n連結：{n.link}"
+            for n in news[:2]
+        ]
+
+        return round(score), good[:2], bad[:2], brief
 
     def classify_stock(self, total_score: int, news_score: int, row: pd.Series) -> str:
         close = float(row["Close"])
@@ -432,13 +461,20 @@ class StockAnalyzer:
         ]
 
         if good_news:
-            lines.append("利多：" + good_news[0])
-        if bad_news:
-            lines.append("利空：" + bad_news[0])
-        if news_brief:
-            lines.append("摘要：" + news_brief[0])
+            lines.append("利多新聞：\n" + good_news[0])
 
-        return "\n".join(lines)[:4900]
+        if bad_news:
+            lines.append("利空新聞：\n" + bad_news[0])
+
+        if news_brief:
+            lines.append("新聞重點：\n" + news_brief[0])
+
+        reply = "\n".join(lines)
+
+        if len(reply) > 4500:
+            reply = reply[:4500] + "\n（內容過長，已自動截斷）"
+
+        return reply
 
 
 analyzer = StockAnalyzer()
