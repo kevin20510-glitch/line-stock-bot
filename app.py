@@ -100,7 +100,19 @@ MANUAL_NAME_TO_CODE = {
     "元大台灣50": "0050",
 }
 
-MANUAL_CODE_TO_NAME = {v: k for k, v in MANUAL_NAME_TO_CODE.items()}
+PREFERRED_CODE_TO_NAME = {
+    "2330": "台積電",
+    "3481": "群創",
+    "2303": "聯電",
+    "2317": "鴻海",
+    "2324": "仁寶",
+    "2312": "金寶",
+    "4526": "東台",
+    "4532": "瑞智",
+    "2882": "國泰金",
+    "2881": "富邦金",
+    "0050": "元大台灣50",
+}
 
 CODE_TO_NAME: Optional[Dict[str, str]] = None
 NAME_TO_CODE: Optional[Dict[str, str]] = None
@@ -134,7 +146,7 @@ def build_code_name_maps() -> Tuple[Dict[str, str], Dict[str, str]]:
 
     for name, code in MANUAL_NAME_TO_CODE.items():
         name_to_code[name] = code
-        code_to_name.setdefault(code, name)
+        code_to_name[code] = PREFERRED_CODE_TO_NAME.get(code, name)
 
     return code_to_name, name_to_code
 
@@ -147,6 +159,18 @@ def ensure_code_maps():
     with CODE_MAP_LOCK:
         if CODE_TO_NAME is None or NAME_TO_CODE is None:
             CODE_TO_NAME, NAME_TO_CODE = build_code_name_maps()
+
+
+def safe_float_from_twse(value: str) -> Optional[float]:
+    if value is None:
+        return None
+    s = str(value).strip().replace(",", "")
+    if s in {"", "--", "X", "除權息", "除權", "除息", "null"}:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 
 class StockAnalyzer:
@@ -179,30 +203,35 @@ class StockAnalyzer:
 
         if s in MANUAL_NAME_TO_CODE:
             code = MANUAL_NAME_TO_CODE[s]
-            return code, MANUAL_CODE_TO_NAME.get(code, s)
+            return code, PREFERRED_CODE_TO_NAME.get(code, s)
 
         if s.isdigit() and len(s) == 4:
             ensure_code_maps()
             if CODE_TO_NAME and s in CODE_TO_NAME:
-                return s, CODE_TO_NAME[s]
+                return s, PREFERRED_CODE_TO_NAME.get(s, CODE_TO_NAME[s])
             raise ValueError(f"找不到台股代碼：{s}")
 
         ensure_code_maps()
 
         if NAME_TO_CODE and s in NAME_TO_CODE:
             code = NAME_TO_CODE[s]
-            return code, CODE_TO_NAME.get(code, s) if CODE_TO_NAME else s
+            if CODE_TO_NAME and code in CODE_TO_NAME:
+                return code, PREFERRED_CODE_TO_NAME.get(code, CODE_TO_NAME[code])
+            return code, PREFERRED_CODE_TO_NAME.get(code, s)
 
         lowered = s.lower()
 
         if NAME_TO_CODE:
             for name, code in NAME_TO_CODE.items():
                 if lowered == name.lower():
-                    return code, CODE_TO_NAME.get(code, name) if CODE_TO_NAME else name
+                    if CODE_TO_NAME and code in CODE_TO_NAME:
+                        return code, PREFERRED_CODE_TO_NAME.get(code, CODE_TO_NAME[code])
+                    return code, PREFERRED_CODE_TO_NAME.get(code, name)
 
+        if CODE_TO_NAME:
             for code, name in CODE_TO_NAME.items():
                 if s in name:
-                    return code, name
+                    return code, PREFERRED_CODE_TO_NAME.get(code, name)
 
         raise ValueError(f"找不到『{user_input}』對應的台股代碼")
 
@@ -233,7 +262,9 @@ class StockAnalyzer:
             lines.append(n.link)
 
         reply = "\n".join(lines)
-        return reply[:4500] if len(reply) > 4500 else reply
+        if len(reply) > 4500:
+            reply = reply[:4500] + "\n（內容過長，已自動截斷）"
+        return reply
 
     def _get_price_cache(self, key: str):
         item = self.price_cache.get(key)
@@ -248,12 +279,68 @@ class StockAnalyzer:
     def _set_price_cache(self, key: str, df: pd.DataFrame, name: str, code: str):
         self.price_cache[key] = (time.time(), df.copy(), name, code)
 
-    def _fetch_monthly_history(self, stock: twstock.Stock, year: int, month: int):
+    def _fetch_monthly_history_twse(self, code: str, year: int, month: int) -> List[dict]:
+        url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+        date_str = f"{year}{month:02d}01"
+
+        params = {
+            "response": "json",
+            "date": date_str,
+            "stockNo": code,
+        }
+
         try:
-            return stock.fetch(year, month)
+            resp = self.session.get(url, params=params, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
         except Exception as e:
-            print(f"抓取 {stock.sid} {year}-{month:02d} 失敗: {e}")
+            print(f"TWSE 抓取失敗 {code} {year}-{month:02d}: {e}")
             return []
+
+        if data.get("stat") != "OK":
+            print(f"TWSE 回傳非 OK {code} {year}-{month:02d}: {data.get('stat')}")
+            return []
+
+        rows = data.get("data", [])
+        parsed = []
+
+        for row in rows:
+            if len(row) < 9:
+                continue
+
+            date_text = row[0].strip()
+            parts = date_text.split("/")
+            if len(parts) != 3:
+                continue
+
+            try:
+                roc_year = int(parts[0])
+                mm = int(parts[1])
+                dd = int(parts[2])
+                ad_year = roc_year + 1911
+                dt = datetime(ad_year, mm, dd)
+            except Exception:
+                continue
+
+            volume = safe_float_from_twse(row[1])
+            open_price = safe_float_from_twse(row[3])
+            high_price = safe_float_from_twse(row[4])
+            low_price = safe_float_from_twse(row[5])
+            close_price = safe_float_from_twse(row[6])
+
+            if close_price is None:
+                continue
+
+            parsed.append({
+                "Date": pd.to_datetime(dt),
+                "Open": open_price,
+                "High": high_price,
+                "Low": low_price,
+                "Close": close_price,
+                "Volume": volume if volume is not None else 0.0,
+            })
+
+        return parsed
 
     def get_price_history(self, symbol: str, months: int = 8) -> Tuple[pd.DataFrame, str, str]:
         code, name = self.resolve_symbol(symbol)
@@ -263,9 +350,8 @@ class StockAnalyzer:
         if cached:
             return cached
 
-        stock = twstock.Stock(code)
         today = datetime.now()
-        rows = []
+        rows: List[dict] = []
 
         for i in range(months):
             y = today.year
@@ -274,7 +360,7 @@ class StockAnalyzer:
                 y -= 1
                 m += 12
 
-            monthly = self._fetch_monthly_history(stock, y, m)
+            monthly = self._fetch_monthly_history_twse(code, y, m)
             if monthly:
                 rows.extend(monthly)
             time.sleep(0.08)
@@ -282,31 +368,16 @@ class StockAnalyzer:
         if not rows:
             raise ValueError(f"抓不到 {name}（{code}）的價格資料")
 
-        data = []
-        seen_dates = set()
-
-        for r in rows:
-            if r.date in seen_dates:
-                continue
-            seen_dates.add(r.date)
-
-            if r.close is None:
-                continue
-
-            data.append({
-                "Date": pd.to_datetime(r.date),
-                "Open": float(r.open) if r.open is not None else None,
-                "High": float(r.high) if r.high is not None else None,
-                "Low": float(r.low) if r.low is not None else None,
-                "Close": float(r.close) if r.close is not None else None,
-                "Volume": float(r.capacity) if r.capacity is not None else 0.0,
-            })
-
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(rows)
         if df.empty:
             raise ValueError(f"抓不到 {name}（{code}）的價格資料")
 
-        df = df.sort_values("Date").dropna(subset=["Close"]).set_index("Date")
+        df = (
+            df.sort_values("Date")
+            .drop_duplicates(subset=["Date"])
+            .dropna(subset=["Close"])
+            .set_index("Date")
+        )
 
         if len(df) < 65:
             raise ValueError(f"{name}（{code}）歷史資料不足，暫時無法分析")
@@ -670,7 +741,7 @@ def handle_message(event):
 
 @app.route("/", methods=["GET"])
 def home():
-    return "LINE 台股機器人運作中 v3-lite"
+    return "LINE 台股機器人運作中 v4-no-twstock-fetch"
 
 
 if __name__ == "__main__":
