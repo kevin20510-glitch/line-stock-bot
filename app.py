@@ -102,6 +102,21 @@ NAME_TO_SYMBOL = {
     "btc": "BTC-USD",
 }
 
+SYMBOL_TO_NAME = {
+    "3481.TW": "群創",
+    "2330.TW": "台積電",
+    "2303.TW": "聯電",
+    "2317.TW": "鴻海",
+    "2324.TW": "仁寶",
+    "2312.TW": "金寶",
+    "4526.TW": "東台",
+    "4532.TW": "瑞智",
+    "2882.TW": "國泰金",
+    "2881.TW": "富邦金",
+    "0050.TW": "元大台灣50",
+    "BTC-USD": "比特幣",
+}
+
 
 @dataclass
 class NewsItem:
@@ -149,7 +164,9 @@ class StockAnalyzer:
             return upper
 
         if s.isdigit():
-            return f"{s}.TW"
+            if len(s) == 4:
+                return f"{s}.TW"
+            return s
 
         candidates = []
         try:
@@ -190,32 +207,50 @@ class StockAnalyzer:
         last_error = None
 
         for code in candidates:
+            print(f"嘗試抓取價格資料: {code}")
+
             try:
                 ticker = yf.Ticker(code)
                 hist = ticker.history(period=period, auto_adjust=True)
 
                 if hist is not None and not hist.empty:
-                    try:
-                        info = ticker.info
-                    except Exception:
-                        info = {}
+                    hist = hist.dropna()
+                    if not hist.empty:
+                        try:
+                            info = ticker.info
+                        except Exception:
+                            info = {}
 
-                    try:
-                        fast_info = getattr(ticker, "fast_info", {}) or {}
-                    except Exception:
-                        fast_info = {}
-
-                    name = (
-                        info.get("shortName")
-                        or info.get("longName")
-                        or fast_info.get("shortName")
-                        or code
-                    )
-                    return hist, name, resolved_symbol
+                        name = (
+                            SYMBOL_TO_NAME.get(code)
+                            or info.get("shortName")
+                            or info.get("longName")
+                            or code
+                        )
+                        print(f"成功抓到 {code} 歷史資料（Ticker.history）")
+                        return hist, name, resolved_symbol
             except Exception as e:
                 last_error = e
-                print(f"取得 {code} 歷史資料失敗:", e)
-                continue
+                print(f"Ticker.history 失敗 {code}: {e}")
+
+            try:
+                hist = yf.download(
+                    code,
+                    period=period,
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,
+                )
+
+                if hist is not None and not hist.empty:
+                    hist = hist.dropna()
+                    if not hist.empty:
+                        name = SYMBOL_TO_NAME.get(code, code)
+                        print(f"成功抓到 {code} 歷史資料（yf.download）")
+                        return hist, name, resolved_symbol
+            except Exception as e:
+                last_error = e
+                print(f"yf.download 失敗 {code}: {e}")
 
         if last_error:
             print("最後錯誤:", last_error)
@@ -482,7 +517,11 @@ class StockAnalyzer:
 
     def analyze_stock_text(self, user_input: str) -> str:
         query = self.normalize_symbol(user_input)
+        print("analyze_stock_text query:", query)
+
         df, name, resolved_symbol = self.get_price_history(query)
+        print("價格資料筆數:", len(df))
+
         df = self.compute_indicators(df)
         row = df.iloc[-1]
         news = self.fetch_google_news(resolved_symbol, name)
