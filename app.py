@@ -60,18 +60,40 @@ SECTOR_KEYWORDS = {
 
 NAME_TO_SYMBOL = {
     "群創": "3481.TW",
+    "群創光電": "3481.TW",
+    "3481": "3481.TW",
+
     "台積電": "2330.TW",
     "台積": "2330.TW",
+    "2330": "2330.TW",
+
     "聯電": "2303.TW",
+    "2303": "2303.TW",
+
     "鴻海": "2317.TW",
+    "2317": "2317.TW",
+
     "仁寶": "2324.TW",
+    "2324": "2324.TW",
+
     "金寶": "2312.TW",
+    "2312": "2312.TW",
+
     "東台": "4526.TW",
+    "4526": "4526.TW",
+
     "瑞智": "4532.TW",
+    "4532": "4532.TW",
+
     "國泰金": "2882.TW",
+    "2882": "2882.TW",
+
     "富邦金": "2881.TW",
+    "2881": "2881.TW",
+
     "元大台灣50": "0050.TW",
     "0050": "0050.TW",
+
     "比特幣": "BTC-USD",
     "bitcoin": "BTC-USD",
     "btc": "BTC-USD",
@@ -95,57 +117,56 @@ class StockAnalyzer:
         self.session.headers.update(HEADERS)
 
     def normalize_symbol(self, symbol: str) -> str:
-        return symbol.strip().upper()
+        s = symbol.strip().replace("　", " ")
+        s = " ".join(s.split())
+
+        if s.startswith("分析 "):
+            s = s[3:].strip()
+
+        return s
 
     def resolve_symbol(self, user_input: str) -> str:
-        s = user_input.strip()
+        s = self.normalize_symbol(user_input)
         if not s:
             raise ValueError("請輸入股票代碼或中文名稱")
 
+        lower = s.lower()
         upper = s.upper()
 
         if s in NAME_TO_SYMBOL:
             return NAME_TO_SYMBOL[s]
-        if s.lower() in NAME_TO_SYMBOL:
-            return NAME_TO_SYMBOL[s.lower()]
-
-        candidates = []
+        if lower in NAME_TO_SYMBOL:
+            return NAME_TO_SYMBOL[lower]
 
         if upper.endswith((".TW", ".TWO", "-USD", "=F", "=X")):
-            candidates.append(upper)
-        elif s.isdigit():
-            candidates.extend([f"{s}.TW", f"{s}.TWO"])
-        else:
-            try:
-                search = yf.Search(s, max_results=10)
-                quotes = getattr(search, "quotes", []) or []
-                for q in quotes:
-                    sym = (q.get("symbol") or "").upper()
-                    exchange = (q.get("exchange") or "").upper()
-                    quote_type = (q.get("quoteType") or "").upper()
-                    if quote_type in ("EQUITY", "ETF") and (
-                        sym.endswith(".TW") or sym.endswith(".TWO") or exchange in ("TAI", "TWO")
-                    ):
-                        candidates.append(sym)
-            except Exception:
-                pass
+            return upper
+
+        if s.isdigit():
+            return f"{s}.TW"
+
+        candidates = []
+        try:
+            search = yf.Search(s, max_results=10)
+            quotes = getattr(search, "quotes", []) or []
+            for q in quotes:
+                sym = (q.get("symbol") or "").upper()
+                exchange = (q.get("exchange") or "").upper()
+                quote_type = (q.get("quoteType") or "").upper()
+
+                if quote_type in ("EQUITY", "ETF") and (
+                    sym.endswith(".TW") or sym.endswith(".TWO") or exchange in ("TAI", "TWO")
+                ):
+                    candidates.append(sym)
+        except Exception:
+            pass
 
         seen = set()
         candidates = [x for x in candidates if x and not (x in seen or seen.add(x))]
 
-        if not candidates:
-            raise ValueError(f"找不到『{user_input}』對應的股票代碼")
+        if candidates:
+            return candidates[0]
 
-        for code in candidates:
-            try:
-                ticker = yf.Ticker(code)
-                hist = ticker.history(period="3mo", auto_adjust=True)
-                if hist is not None and not hist.empty:
-                    return code
-            except Exception:
-                continue
-
-        raise ValueError(f"找不到『{user_input}』可用的股票代碼，已嘗試：{', '.join(candidates)}")
+        raise ValueError(f"找不到『{user_input}』對應的股票代碼")
 
     def get_price_history(self, symbol: str, period: str = "1y") -> Tuple[pd.DataFrame, str, str]:
         resolved_symbol = self.resolve_symbol(symbol)
@@ -384,8 +405,8 @@ class StockAnalyzer:
         return "避開"
 
     def analyze_stock_text(self, user_input: str) -> str:
-        symbol = self.normalize_symbol(user_input)
-        df, name, resolved_symbol = self.get_price_history(symbol)
+        query = self.normalize_symbol(user_input)
+        df, name, resolved_symbol = self.get_price_history(query)
         df = self.compute_indicators(df)
         row = df.iloc[-1]
         news = self.fetch_google_news(resolved_symbol, name)
@@ -440,6 +461,7 @@ def get_help_text() -> str:
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+    print("收到 webhook body:", body[:500])
 
     try:
         handler.handle(body, signature)
@@ -460,11 +482,13 @@ def handle_message(event):
         reply_text = get_help_text()
     else:
         try:
-            query = user_text
-            if user_text.startswith("分析 "):
-                query = user_text[3:].strip()
+            query = analyzer.normalize_symbol(user_text)
+            print("收到訊息:", repr(user_text))
+            print("整理後查詢:", repr(query))
+            print("解析代碼:", analyzer.resolve_symbol(query))
             reply_text = analyzer.analyze_stock_text(query)
         except Exception as e:
+            print("分析失敗:", e)
             reply_text = f"分析失敗：{e}\n\n{get_help_text()}"
 
     configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
