@@ -1,10 +1,12 @@
 import os
 import time
 import urllib.parse
+import urllib3
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -35,6 +37,27 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     )
 }
+
+# 關閉 SSL 警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# 只針對 TWSE 關閉 verify，避免 Render / Python 3.14 憑證問題
+_original_request = requests.sessions.Session.request
+
+
+def patched_request(self, method, url, **kwargs):
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        host = ""
+
+    if host in {"www.twse.com.tw", "twse.com.tw"}:
+        kwargs["verify"] = False
+
+    return _original_request(self, method, url, **kwargs)
+
+
+requests.sessions.Session.request = patched_request
 
 PRICE_CACHE_TTL = 300
 NEWS_CACHE_TTL = 600
