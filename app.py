@@ -123,8 +123,13 @@ class StockAnalyzer:
     def normalize_symbol(self, symbol: str) -> str:
         s = symbol.strip().replace("　", " ")
         s = " ".join(s.split())
-        if s.startswith("分析 "):
-            s = s[3:].strip()
+
+        prefixes = ["分析", "查詢", "股票", "股價"]
+        for prefix in prefixes:
+            if s.startswith(prefix):
+                s = s[len(prefix):].strip()
+                break
+
         return s
 
     def resolve_symbol(self, user_input: str) -> str:
@@ -159,8 +164,8 @@ class StockAnalyzer:
                     sym.endswith(".TW") or sym.endswith(".TWO") or exchange in ("TAI", "TWO")
                 ):
                     candidates.append(sym)
-        except Exception:
-            pass
+        except Exception as e:
+            print("yf.Search 失敗:", e)
 
         seen = set()
         candidates = [x for x in candidates if x and not (x in seen or seen.add(x))]
@@ -182,19 +187,38 @@ class StockAnalyzer:
         seen = set()
         candidates = [x for x in candidates if x and not (x in seen or seen.add(x))]
 
+        last_error = None
+
         for code in candidates:
             try:
                 ticker = yf.Ticker(code)
                 hist = ticker.history(period=period, auto_adjust=True)
+
                 if hist is not None and not hist.empty:
                     try:
                         info = ticker.info
                     except Exception:
                         info = {}
-                    name = info.get("shortName") or info.get("longName") or code
+
+                    try:
+                        fast_info = getattr(ticker, "fast_info", {}) or {}
+                    except Exception:
+                        fast_info = {}
+
+                    name = (
+                        info.get("shortName")
+                        or info.get("longName")
+                        or fast_info.get("shortName")
+                        or code
+                    )
                     return hist, name, resolved_symbol
-            except Exception:
+            except Exception as e:
+                last_error = e
+                print(f"取得 {code} 歷史資料失敗:", e)
                 continue
+
+        if last_error:
+            print("最後錯誤:", last_error)
 
         raise ValueError(f"抓不到 {symbol} 的價格資料。已解析代碼：{', '.join(candidates)}")
 
@@ -261,12 +285,32 @@ class StockAnalyzer:
         summary = self.summarize_title(text, sentiment, matched)
         return sentiment, score, matched, summary
 
+    def resolve_google_news_link(self, url: str) -> str:
+        if not url:
+            return url
+
+        try:
+            resp = self.session.get(url, timeout=10, allow_redirects=True, stream=True)
+            final_url = resp.url
+            resp.close()
+            return final_url or url
+        except Exception as e:
+            print("解析 Google News 連結失敗:", e)
+            return url
+
+    def shorten_url(self, url: str, max_len: int = 100) -> str:
+        if not url:
+            return url
+        return url if len(url) <= max_len else url[:max_len] + "..."
+
     def fetch_google_news(self, symbol: str, name: str, days: int = 30, max_items: int = 5) -> List[NewsItem]:
         query = self.build_news_query(symbol, name)
         rss_url = (
             "https://news.google.com/rss/search?hl=zh-TW&gl=TW&ceid=TW:zh-Hant&q="
             + urllib.parse.quote(query)
         )
+
+        print("Google News RSS:", rss_url)
 
         resp = self.session.get(rss_url, timeout=20)
         resp.raise_for_status()
@@ -278,7 +322,10 @@ class StockAnalyzer:
         for item in root.findall("./channel/item"):
             title = (item.findtext("title") or "").strip()
             pub_date = (item.findtext("pubDate") or "").strip()
-            link = (item.findtext("link") or "").strip()
+
+            raw_link = (item.findtext("link") or "").strip()
+            link = self.resolve_google_news_link(raw_link)
+
             source_el = item.find("source")
             source = source_el.text.strip() if source_el is not None and source_el.text else "未知來源"
 
@@ -390,15 +437,15 @@ class StockAnalyzer:
         score = max(0, min(100, 50 + total * 4))
 
         good = [
-            f"{n.published}｜{n.title}\n連結：{n.link}"
+            f"{n.published}｜{n.title}\n網址：{self.shorten_url(n.link)}"
             for n in news if n.sentiment == "利多"
         ]
         bad = [
-            f"{n.published}｜{n.title}\n連結：{n.link}"
+            f"{n.published}｜{n.title}\n網址：{self.shorten_url(n.link)}"
             for n in news if n.sentiment == "利空"
         ]
         brief = [
-            f"{n.published}｜{n.source}｜{n.summary}\n連結：{n.link}"
+            f"{n.published}｜{n.source}｜{n.summary}\n網址：{self.shorten_url(n.link)}"
             for n in news[:2]
         ]
 
@@ -488,8 +535,9 @@ def get_help_text() -> str:
         "例如：2330、台積電、3481、群創、BTC-USD\n\n"
         "可用指令：\n"
         "help：顯示說明\n"
-        "分析 台積電\n"
-        "分析 2330"
+        "分析台積電\n"
+        "分析 2330\n"
+        "查詢群創"
     )
 
 
@@ -502,6 +550,7 @@ def callback():
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
+        print("Signature 驗證失敗")
         abort(400)
     except Exception as e:
         print("Webhook error:", e)
