@@ -1,0 +1,7 @@
+flask
+requests
+pandas
+yfinance
+ta
+line-bot-sdk
+gunicorn
