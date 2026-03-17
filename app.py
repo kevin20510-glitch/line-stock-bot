@@ -4,7 +4,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import requests
@@ -38,7 +38,6 @@ HEADERS = {
 
 PRICE_CACHE_TTL = 300
 NEWS_CACHE_TTL = 600
-
 
 BULLISH_KEYWORDS = [
     "營收成長", "營收創高", "獲利成長", "eps", "擴產", "接單", "訂單", "法說會樂觀",
@@ -119,6 +118,7 @@ class StockAnalyzer:
         self.session.headers.update(HEADERS)
         self.price_cache: Dict[str, Tuple[float, pd.DataFrame, str, str]] = {}
         self.news_cache: Dict[str, Tuple[float, List[NewsItem]]] = {}
+        self.user_last_query: Dict[str, Dict[str, str]] = {}
 
     def normalize_symbol(self, symbol: str) -> str:
         s = symbol.strip().replace("　", " ")
@@ -131,6 +131,10 @@ class StockAnalyzer:
                 break
 
         return s
+
+    def is_link_request(self, text: str) -> bool:
+        s = text.strip().lower()
+        return s in ["新聞連結", "連結", "網址", "news", "link"]
 
     def resolve_symbol(self, user_input: str) -> Tuple[str, str]:
         s = self.normalize_symbol(user_input)
@@ -159,6 +163,43 @@ class StockAnalyzer:
                 return code, name
 
         raise ValueError(f"找不到『{user_input}』對應的台股代碼")
+
+    def set_user_last_query(self, user_id: str, code: str, name: str):
+        if not user_id:
+            return
+        self.user_last_query[user_id] = {
+            "code": code,
+            "name": name,
+        }
+
+    def get_last_news_links_text(self, user_id: str) -> str:
+        if not user_id:
+            return "目前無法辨識使用者，請先重新查詢股票。"
+
+        last = self.user_last_query.get(user_id)
+        if not last:
+            return "目前沒有你的最近查詢紀錄，請先輸入股票代碼或中文名稱，例如：台積電、2330"
+
+        code = last.get("code")
+        name = last.get("name")
+
+        if not code or not name:
+            return "目前沒有你的最近查詢紀錄，請先重新查詢股票。"
+
+        news = self.fetch_google_news(code, name)
+
+        if not news:
+            return f"{name}（{code}）目前找不到近期新聞連結。"
+
+        lines = [f"{name}（{code}）新聞連結："]
+        for i, n in enumerate(news[:3], start=1):
+            lines.append(f"{i}. {n.title}")
+            lines.append(n.link)
+
+        reply = "\n".join(lines)
+        if len(reply) > 4500:
+            reply = reply[:4500] + "\n（內容過長，已自動截斷）"
+        return reply
 
     def _get_price_cache(self, key: str):
         item = self.price_cache.get(key)
@@ -313,11 +354,6 @@ class StockAnalyzer:
             print("解析 Google News 連結失敗:", e)
             return url
 
-    def shorten_url(self, url: str, max_len: int = 100) -> str:
-        if not url:
-            return url
-        return url if len(url) <= max_len else url[:max_len] + "..."
-
     def fetch_google_news(self, code: str, name: str, days: int = 30, max_items: int = 5) -> List[NewsItem]:
         cache_key = f"{code}|{name}|{days}|{max_items}"
         item = self.news_cache.get(cache_key)
@@ -461,15 +497,15 @@ class StockAnalyzer:
         score = max(0, min(100, 50 + total * 4))
 
         good = [
-            f"{n.published}｜{n.title}\n網址：{self.shorten_url(n.link)}"
+            f"{n.published}｜{n.source}｜{n.title}"
             for n in news if n.sentiment == "利多"
         ]
         bad = [
-            f"{n.published}｜{n.title}\n網址：{self.shorten_url(n.link)}"
+            f"{n.published}｜{n.source}｜{n.title}"
             for n in news if n.sentiment == "利空"
         ]
         brief = [
-            f"{n.published}｜{n.source}｜{n.summary}\n網址：{self.shorten_url(n.link)}"
+            f"{n.published}｜{n.source}｜{n.summary}"
             for n in news[:2]
         ]
 
@@ -565,7 +601,8 @@ def get_help_text() -> str:
         "help：顯示說明\n"
         "分析台積電\n"
         "分析 2330\n"
-        "查詢群創"
+        "查詢群創\n"
+        "新聞連結：顯示你最近一次查詢股票的新聞網址"
     )
 
 
@@ -591,16 +628,29 @@ def callback():
 def handle_message(event):
     user_text = event.message.text.strip()
 
+    user_id = ""
+    try:
+        user_id = event.source.user_id
+    except Exception:
+        user_id = "unknown"
+
     if user_text.lower() in ["help", "說明", "幫助"]:
         reply_text = get_help_text()
+    elif analyzer.is_link_request(user_text):
+        reply_text = analyzer.get_last_news_links_text(user_id)
     else:
         try:
             query = analyzer.normalize_symbol(user_text)
             print("收到訊息:", repr(user_text))
+            print("user_id:", user_id)
             print("整理後查詢:", repr(query))
+
             code, name = analyzer.resolve_symbol(query)
             print("解析代碼:", code, name)
+
+            analyzer.set_user_last_query(user_id, code, name)
             reply_text = analyzer.analyze_stock_text(query)
+
         except Exception as e:
             print("分析失敗:", e)
             reply_text = f"分析失敗：{e}\n\n{get_help_text()}"
