@@ -1,9 +1,10 @@
 import os
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import requests
@@ -35,6 +36,9 @@ HEADERS = {
     )
 }
 
+PRICE_CACHE_TTL = 300
+NEWS_CACHE_TTL = 600
+
 BULLISH_KEYWORDS = [
     "營收成長", "營收創高", "獲利成長", "eps", "擴產", "接單", "訂單", "法說會樂觀",
     "股利", "配息", "ai", "合作", "併購", "上調目標價", "調升評等", "利多",
@@ -65,38 +69,27 @@ NAME_TO_SYMBOL = {
     "群創": "3481.TW",
     "群創光電": "3481.TW",
     "3481": "3481.TW",
-
     "台積電": "2330.TW",
     "台積": "2330.TW",
     "2330": "2330.TW",
-
     "聯電": "2303.TW",
     "2303": "2303.TW",
-
     "鴻海": "2317.TW",
     "2317": "2317.TW",
-
     "仁寶": "2324.TW",
     "2324": "2324.TW",
-
     "金寶": "2312.TW",
     "2312": "2312.TW",
-
     "東台": "4526.TW",
     "4526": "4526.TW",
-
     "瑞智": "4532.TW",
     "4532": "4532.TW",
-
     "國泰金": "2882.TW",
     "2882": "2882.TW",
-
     "富邦金": "2881.TW",
     "2881": "2881.TW",
-
     "元大台灣50": "0050.TW",
     "0050": "0050.TW",
-
     "比特幣": "BTC-USD",
     "bitcoin": "BTC-USD",
     "btc": "BTC-USD",
@@ -134,6 +127,8 @@ class StockAnalyzer:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
+        self.price_cache: Dict[str, Tuple[float, pd.DataFrame, str, str]] = {}
+        self.news_cache: Dict[str, Tuple[float, List[NewsItem]]] = {}
 
     def normalize_symbol(self, symbol: str) -> str:
         s = symbol.strip().replace("　", " ")
@@ -192,8 +187,66 @@ class StockAnalyzer:
 
         raise ValueError(f"找不到『{user_input}』對應的股票代碼")
 
+    def _get_price_cache(self, key: str):
+        item = self.price_cache.get(key)
+        if not item:
+            return None
+        ts, df, name, resolved_symbol = item
+        if time.time() - ts <= PRICE_CACHE_TTL:
+            print(f"價格快取命中: {key}")
+            return df.copy(), name, resolved_symbol
+        self.price_cache.pop(key, None)
+        return None
+
+    def _set_price_cache(self, key: str, df: pd.DataFrame, name: str, resolved_symbol: str):
+        self.price_cache[key] = (time.time(), df.copy(), name, resolved_symbol)
+
+    def _download_history_with_retry(self, code: str, period: str):
+        methods = ["ticker", "download"]
+
+        for method in methods:
+            for attempt in range(3):
+                try:
+                    if method == "ticker":
+                        ticker = yf.Ticker(code)
+                        hist = ticker.history(period=period, auto_adjust=True)
+                    else:
+                        hist = yf.download(
+                            code,
+                            period=period,
+                            auto_adjust=True,
+                            progress=False,
+                            threads=False,
+                        )
+
+                    if hist is not None and not hist.empty:
+                        hist = hist.dropna()
+                        if not hist.empty:
+                            print(f"{code} 抓價成功，方法={method}，第 {attempt + 1} 次")
+                            return hist, method
+
+                except Exception as e:
+                    msg = str(e)
+                    print(f"{code} 抓價失敗，方法={method}，第 {attempt + 1} 次：{msg}")
+
+                    if "Too Many Requests" in msg or "Rate limited" in msg:
+                        wait_sec = 2 + attempt * 2
+                        print(f"{code} 遇到限流，等待 {wait_sec} 秒後重試")
+                        time.sleep(wait_sec)
+                        continue
+
+                time.sleep(1)
+
+        return None, None
+
     def get_price_history(self, symbol: str, period: str = "1y") -> Tuple[pd.DataFrame, str, str]:
         resolved_symbol = self.resolve_symbol(symbol)
+        cache_key = f"{resolved_symbol}|{period}"
+
+        cached = self._get_price_cache(cache_key)
+        if cached:
+            return cached
+
         candidates = [resolved_symbol]
 
         if resolved_symbol.endswith(".TW"):
@@ -209,52 +262,29 @@ class StockAnalyzer:
         for code in candidates:
             print(f"嘗試抓取價格資料: {code}")
 
-            try:
-                ticker = yf.Ticker(code)
-                hist = ticker.history(period=period, auto_adjust=True)
+            hist, method = self._download_history_with_retry(code, period)
+            if hist is not None and not hist.empty:
+                name = SYMBOL_TO_NAME.get(code, code)
 
-                if hist is not None and not hist.empty:
-                    hist = hist.dropna()
-                    if not hist.empty:
-                        try:
-                            info = ticker.info
-                        except Exception:
-                            info = {}
-
+                if method == "ticker":
+                    try:
+                        ticker = yf.Ticker(code)
+                        info = ticker.info
                         name = (
                             SYMBOL_TO_NAME.get(code)
                             or info.get("shortName")
                             or info.get("longName")
                             or code
                         )
-                        print(f"成功抓到 {code} 歷史資料（Ticker.history）")
-                        return hist, name, resolved_symbol
-            except Exception as e:
-                last_error = e
-                print(f"Ticker.history 失敗 {code}: {e}")
+                    except Exception as e:
+                        print(f"讀取 {code} info 失敗:", e)
 
-            try:
-                hist = yf.download(
-                    code,
-                    period=period,
-                    auto_adjust=True,
-                    progress=False,
-                    threads=False,
-                )
+                self._set_price_cache(cache_key, hist, name, resolved_symbol)
+                return hist, name, resolved_symbol
 
-                if hist is not None and not hist.empty:
-                    hist = hist.dropna()
-                    if not hist.empty:
-                        name = SYMBOL_TO_NAME.get(code, code)
-                        print(f"成功抓到 {code} 歷史資料（yf.download）")
-                        return hist, name, resolved_symbol
-            except Exception as e:
-                last_error = e
-                print(f"yf.download 失敗 {code}: {e}")
+            last_error = f"{code} 無法取得價格資料"
 
-        if last_error:
-            print("最後錯誤:", last_error)
-
+        print("最後錯誤:", last_error)
         raise ValueError(f"抓不到 {symbol} 的價格資料。已解析代碼：{', '.join(candidates)}")
 
     def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -339,6 +369,14 @@ class StockAnalyzer:
         return url if len(url) <= max_len else url[:max_len] + "..."
 
     def fetch_google_news(self, symbol: str, name: str, days: int = 30, max_items: int = 5) -> List[NewsItem]:
+        cache_key = f"{symbol}|{name}|{days}|{max_items}"
+        item = self.news_cache.get(cache_key)
+        if item:
+            ts, cached_news = item
+            if time.time() - ts <= NEWS_CACHE_TTL:
+                print(f"新聞快取命中: {cache_key}")
+                return cached_news
+
         query = self.build_news_query(symbol, name)
         rss_url = (
             "https://news.google.com/rss/search?hl=zh-TW&gl=TW&ceid=TW:zh-Hant&q="
@@ -392,6 +430,7 @@ class StockAnalyzer:
             if len(items) >= max_items:
                 break
 
+        self.news_cache[cache_key] = (time.time(), items)
         return items
 
     def score_trend(self, row: pd.Series) -> Tuple[int, str]:
