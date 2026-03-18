@@ -178,7 +178,19 @@ def safe_float_from_twse(value: str) -> Optional[float]:
         return None
 
 
+def safe_float(value, default=0.0):
+    try:
+        if pd.notna(value):
+            return float(value)
+    except Exception:
+        pass
+    return default
+
+
 def clamp_reply_text(text: str, max_len: int = MAX_REPLY_LENGTH) -> str:
+    if not text:
+        return "查無資料"
+    text = str(text).strip()
     if len(text) <= max_len:
         return text
     return text[: max_len - 12] + "\n（內容過長）"
@@ -643,39 +655,138 @@ class StockAnalyzer:
     def analyze_stock_text(self, user_input: str) -> str:
         query = self.normalize_symbol(user_input)
 
-        df, name, code = self.get_price_history(query)
-        df = self.compute_indicators(df)
-        row = df.iloc[-1]
-        news = self.fetch_google_news(code, name)
+        try:
+            df, name, code = self.get_price_history(query)
+            if df is None or df.empty:
+                return clamp_reply_text(f"查無 {query} 的股價資料，請確認股票代碼或名稱是否正確。")
 
-        trend_score, signal = self.score_trend(row)
-        news_score, good_news, bad_news, news_brief = self.score_news(news)
-        total_score = round(trend_score * 0.65 + news_score * 0.35)
-        sector_guess = self.classify_sector(code, name, [n.title for n in news])
-        category = self.classify_stock(total_score, news_score, row)
-        action = self.suggest_action(total_score, trend_score, news_score, row)
+            df = self.compute_indicators(df)
+            if df is None or df.empty:
+                return clamp_reply_text(f"{query} 指標計算失敗，請稍後再試。")
 
-        current_price = float(row["Close"])
-        ret20 = float(row["RET20"]) if pd.notna(row["RET20"]) else 0
-        ret60 = float(row["RET60"]) if pd.notna(row["RET60"]) else 0
+            if len(df) == 0:
+                return clamp_reply_text(f"{query} 沒有足夠資料可供分析。")
 
-        lines = [
-            f"{name}（{code}）",
-            f"現價：{current_price:.2f}",
-            f"20日漲跌：{ret20:.2f}%｜60日漲跌：{ret60:.2f}%",
-            f"總分：{total_score}/100｜技術：{trend_score}｜新聞：{news_score}",
-            f"趨勢：{signal}｜分類：{category}",
-            f"題材：{sector_guess}｜建議：{action}",
-        ]
+            row = df.iloc[-1]
 
-        if good_news:
-            lines.append("利多新聞：\n" + good_news[0])
-        if bad_news:
-            lines.append("利空新聞：\n" + bad_news[0])
-        if news_brief:
-            lines.append("新聞重點：\n" + news_brief[0])
+            try:
+                news = self.fetch_google_news(code, name)
+                if not news:
+                    news = []
+            except Exception:
+                news = []
 
-        return clamp_reply_text("\n".join(lines))
+            try:
+                trend_score, signal = self.score_trend(row)
+            except Exception:
+                trend_score, signal = 0, "未知"
+
+            try:
+                news_score, good_news, bad_news, news_brief = self.score_news(news)
+                good_news = good_news if good_news else []
+                bad_news = bad_news if bad_news else []
+                if not isinstance(news_brief, list):
+                    news_brief = [str(news_brief)] if news_brief else []
+            except Exception:
+                news_score, good_news, bad_news, news_brief = 0, [], [], []
+
+            try:
+                total_score = round(trend_score * 0.65 + news_score * 0.35)
+            except Exception:
+                total_score = 0
+
+            try:
+                news_titles = [getattr(n, "title", "") for n in news if n]
+                sector_guess = self.classify_sector(code, name, news_titles)
+                if not sector_guess:
+                    sector_guess = "其他"
+            except Exception:
+                sector_guess = "其他"
+
+            try:
+                category = self.classify_stock(total_score, news_score, row)
+                if not category:
+                    category = "一般觀察股"
+            except Exception:
+                category = "一般觀察股"
+
+            try:
+                action = self.suggest_action(total_score, trend_score, news_score, row)
+                if not action:
+                    action = "觀望"
+            except Exception:
+                action = "觀望"
+
+            current_price = safe_float(row.get("Close"))
+            ret20 = safe_float(row.get("RET20"))
+            ret60 = safe_float(row.get("RET60"))
+
+            lines = [
+                f"{name}（{code}）",
+                f"現價：{current_price:.2f}",
+                f"20日漲跌：{ret20:.2f}%｜60日漲跌：{ret60:.2f}%",
+                f"總分：{total_score}/100｜技術：{trend_score}｜新聞：{news_score}",
+                f"趨勢：{signal}｜分類：{category}",
+                f"題材：{sector_guess}｜建議：{action}",
+            ]
+
+            if good_news:
+                good_text = str(good_news[0]).strip()
+                if good_text:
+                    lines.append("利多新聞：")
+                    lines.append(good_text[:120])
+
+            if bad_news:
+                bad_text = str(bad_news[0]).strip()
+                if bad_text:
+                    lines.append("利空新聞：")
+                    lines.append(bad_text[:120])
+
+            if news_brief:
+                lines.append("摘要：")
+                for brief in news_brief[:2]:
+                    brief_text = str(brief).strip()
+                    if brief_text:
+                        lines.append(brief_text[:120])
+
+            if news:
+                lines.append("新聞重點：")
+                for i, item in enumerate(news[:2], start=1):
+                    published = str(getattr(item, "published", "未知時間")).strip() or "未知時間"
+                    source = str(getattr(item, "source", "未知來源")).strip() or "未知來源"
+                    summary = getattr(item, "summary", "")
+                    title = getattr(item, "title", "")
+                    link = str(getattr(item, "link", "")).strip()
+
+                    text = str(summary).strip() if summary else str(title).strip()
+                    if not text:
+                        text = "無摘要"
+
+                    text = text[:70]
+                    lines.append(f"{i}. {published}｜{source}｜{text}")
+                    if link:
+                        lines.append(link)
+
+                try:
+                    base_url = globals().get("BASE_URL", "").strip().rstrip("/")
+                    if base_url:
+                        lines.append("更多新聞：")
+                        lines.append(f"{base_url}/news/{code}")
+                except Exception:
+                    pass
+
+            cleaned_lines = []
+            for line in lines:
+                if line is None:
+                    continue
+                line = str(line).strip()
+                if line:
+                    cleaned_lines.append(line)
+
+            return clamp_reply_text("\n".join(cleaned_lines))
+
+        except Exception as e:
+            return clamp_reply_text(f"分析 {query} 失敗：{str(e)}")
 
 
 analyzer = StockAnalyzer()
